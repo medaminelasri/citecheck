@@ -35,6 +35,10 @@ async function sendTelegram(message) {
   }
 }
 
+function normalizeText(text) {
+  return text.replace(/\s+/g, " ").trim();
+}
+
 async function fillDateField(page, labelText, value) {
   const locators = [
     page.getByLabel(new RegExp(labelText, "i")),
@@ -44,17 +48,14 @@ async function fillDateField(page, labelText, value) {
 
   for (const locator of locators) {
     try {
-      const count = await locator.count();
-      if (count > 0) {
+      if (await locator.count()) {
         const input = locator.first();
         await input.click({ force: true });
         await input.fill("");
         await input.type(value, { delay: 40 });
         return;
       }
-    } catch {
-      // try next locator
-    }
+    } catch {}
   }
 
   throw new Error(`Could not find field for: ${labelText}`);
@@ -70,34 +71,65 @@ async function clickSuivant(page) {
 
   for (const locator of buttonLocators) {
     try {
-      const count = await locator.count();
-      if (count > 0) {
+      if (await locator.count()) {
         await locator.first().click({ force: true });
         return;
       }
-    } catch {
-      // try next locator
-    }
+    } catch {}
   }
 
   throw new Error('Could not find the "Suivant" button');
 }
 
-function normalizeText(text) {
-  return text.replace(/\s+/g, " ").trim();
-}
+async function waitForResult(page) {
+  const start = Date.now();
+  const timeoutMs = 45000;
 
-function pageLooksAvailable(bodyText) {
-  const requiredMarkers = [
-    "Réserver",
-    "Nom *",
-    "Prénom *",
-    "Date de naissance *",
-    "Email *",
-    "ENVOYER MA DEMANDE"
-  ];
+  while (Date.now() - start < timeoutMs) {
+    const currentUrl = page.url();
+    const bodyText = normalizeText(await page.locator("body").innerText().catch(() => ""));
 
-  return requiredMarkers.every(marker => bodyText.includes(marker));
+    const hasFullMessage = bodyText.includes(FULL_MESSAGE);
+
+    const hasReservationForm =
+      bodyText.includes("Réserver") &&
+      bodyText.includes("Nom *") &&
+      bodyText.includes("Prénom *") &&
+      bodyText.includes("Date de naissance *") &&
+      bodyText.includes("Email *") &&
+      bodyText.includes("ENVOYER MA DEMANDE");
+
+    const hasDateOk = currentUrl.includes("date_ok=1");
+
+    if (hasFullMessage || hasReservationForm || hasDateOk) {
+      return {
+        currentUrl,
+        bodyText,
+        hasFullMessage,
+        hasReservationForm,
+        hasDateOk
+      };
+    }
+
+    await page.waitForTimeout(1500);
+  }
+
+  const currentUrl = page.url();
+  const bodyText = normalizeText(await page.locator("body").innerText().catch(() => ""));
+
+  return {
+    currentUrl,
+    bodyText,
+    hasFullMessage: bodyText.includes(FULL_MESSAGE),
+    hasReservationForm:
+      bodyText.includes("Réserver") &&
+      bodyText.includes("Nom *") &&
+      bodyText.includes("Prénom *") &&
+      bodyText.includes("Date de naissance *") &&
+      bodyText.includes("Email *") &&
+      bodyText.includes("ENVOYER MA DEMANDE"),
+    hasDateOk: currentUrl.includes("date_ok=1")
+  };
 }
 
 async function checkOnce() {
@@ -125,26 +157,20 @@ async function checkOnce() {
     await fillDateField(page, "Date de début du séjour", CHECKIN_DATE);
     await fillDateField(page, "Date de fin du séjour", CHECKOUT_DATE);
 
-    await page.waitForTimeout(800);
+    await page.waitForTimeout(1000);
     await clickSuivant(page);
 
-    await page.waitForLoadState("networkidle", { timeout: 60000 }).catch(() => {});
-    await page.waitForTimeout(3000);
+    await page.waitForLoadState("domcontentloaded", { timeout: 30000 }).catch(() => {});
+    await page.waitForTimeout(2000);
 
-    const currentUrl = page.url();
-    const bodyTextRaw = await page.locator("body").innerText();
-    const bodyText = normalizeText(bodyTextRaw);
-
-    const hasFullMessage = bodyText.includes(FULL_MESSAGE);
-    const hasReservationForm = pageLooksAvailable(bodyText);
-    const hasDateOk = currentUrl.includes("date_ok=1");
+    const result = await waitForResult(page);
 
     return {
-      currentUrl,
-      hasFullMessage,
-      hasReservationForm,
-      hasDateOk,
-      preview: bodyText.slice(0, 1500)
+      currentUrl: result.currentUrl,
+      hasFullMessage: result.hasFullMessage,
+      hasReservationForm: result.hasReservationForm,
+      hasDateOk: result.hasDateOk,
+      preview: result.bodyText.slice(0, 1500)
     };
   } finally {
     await context.close();
@@ -159,32 +185,29 @@ async function main() {
     try {
       const result = await checkOnce();
 
+      console.log("Final URL:", result.currentUrl);
+      console.log("hasFullMessage:", result.hasFullMessage);
+      console.log("hasReservationForm:", result.hasReservationForm);
+      console.log("hasDateOk:", result.hasDateOk);
+      console.log("Preview:", result.preview);
+
       if (result.hasFullMessage) {
-        console.log("No alert: unavailable message still present.");
+        console.log("No alert: unavailable message detected.");
         return;
       }
 
-      if (result.hasReservationForm && result.hasDateOk) {
+      if (result.hasDateOk && result.hasReservationForm) {
         await sendTelegram(
           `ALERT ✅ Reservation form detected\n\n` +
-          `The page looks AVAILABLE for these dates:\n` +
-          `${CHECKIN_DATE} -> ${CHECKOUT_DATE}\n\n` +
+          `Dates: ${CHECKIN_DATE} -> ${CHECKOUT_DATE}\n\n` +
           `URL:\n${result.currentUrl}\n\n` +
-          `Detected markers:\n` +
-          `- Réserver\n` +
-          `- Nom *\n` +
-          `- Prénom *\n` +
-          `- Date de naissance *\n` +
-          `- Email *\n` +
-          `- ENVOYER MA DEMANDE`
+          `The page appears to be available and shows the reservation form.`
         );
-
-        console.log("Alert sent: reservation form detected.");
+        console.log("Alert sent.");
         return;
       }
 
-      console.log("No alert: page changed, but real reservation form was not detected.");
-      console.log(result.preview);
+      console.log("No alert: neither unavailable page nor confirmed reservation form.");
       return;
     } catch (error) {
       lastError = error;
