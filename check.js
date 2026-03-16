@@ -82,13 +82,15 @@ async function clickSuivant(page) {
   throw new Error('Could not find the "Suivant" button');
 }
 
-async function detectFormPage(page) {
+async function detectResult(page) {
   const bodyText = normalizeText(await page.locator("body").innerText().catch(() => ""));
+  const currentUrl = page.url();
+
   const hasFullMessage = bodyText.includes(FULL_MESSAGE);
+  const hasDateOk = currentUrl.includes("date_ok=1");
 
   const textMarkers = {
     typeLogement: bodyText.includes("Type de logement"),
-    envoyer: bodyText.includes("ENVOYER MA DEMANDE"),
     nom: bodyText.includes("Nom"),
     prenom: bodyText.includes("Prénom"),
     email: bodyText.includes("Email")
@@ -96,30 +98,28 @@ async function detectFormPage(page) {
 
   const inputCount = await page.locator("input").count().catch(() => 0);
   const selectCount = await page.locator("select").count().catch(() => 0);
-  const submitButtonCount = await page
-    .locator('button:has-text("ENVOYER MA DEMANDE"), input[type="submit"]')
-    .count()
-    .catch(() => 0);
+  const submitButtonCount = await page.locator('button, input[type="submit"]').count().catch(() => 0);
 
-  const looksLikeRealForm =
+  const looksLikeAvailableForm =
+    hasDateOk &&
     !hasFullMessage &&
     textMarkers.typeLogement &&
-    textMarkers.envoyer &&
     textMarkers.nom &&
     textMarkers.prenom &&
     textMarkers.email &&
-    inputCount >= 4 &&
+    inputCount >= 8 &&
     selectCount >= 1 &&
     submitButtonCount >= 1;
 
   return {
+    currentUrl,
     hasFullMessage,
-    looksLikeRealForm,
+    hasDateOk,
     textMarkers,
     inputCount,
     selectCount,
     submitButtonCount,
-    currentUrl: page.url()
+    looksLikeAvailableForm
   };
 }
 
@@ -128,20 +128,16 @@ async function waitForStableResult(page) {
   const start = Date.now();
 
   while (Date.now() - start < timeoutMs) {
-    const result = await detectFormPage(page);
+    const result = await detectResult(page);
 
-    if (result.hasFullMessage) {
-      return result;
-    }
-
-    if (result.looksLikeRealForm) {
+    if (result.hasFullMessage || result.looksLikeAvailableForm) {
       return result;
     }
 
     await page.waitForTimeout(1500);
   }
 
-  return await detectFormPage(page);
+  return await detectResult(page);
 }
 
 async function checkOnce() {
@@ -191,7 +187,8 @@ async function main() {
 
       console.log("Final URL:", result.currentUrl);
       console.log("hasFullMessage:", result.hasFullMessage);
-      console.log("looksLikeRealForm:", result.looksLikeRealForm);
+      console.log("hasDateOk:", result.hasDateOk);
+      console.log("looksLikeAvailableForm:", result.looksLikeAvailableForm);
       console.log("textMarkers:", result.textMarkers);
       console.log("inputCount:", result.inputCount);
       console.log("selectCount:", result.selectCount);
@@ -202,7 +199,7 @@ async function main() {
         return;
       }
 
-      if (result.looksLikeRealForm) {
+      if (result.looksLikeAvailableForm) {
         await sendTelegram(
           `ALERT ✅ Housing form detected\n\n` +
           `Dates: ${CHECKIN_DATE} -> ${CHECKOUT_DATE}\n` +
@@ -213,7 +210,7 @@ async function main() {
         return;
       }
 
-      console.log("No alert: page did not match unavailable page or real form page.");
+      console.log("No alert: page did not match unavailable page or available form strongly enough.");
       return;
     } catch (error) {
       lastError = error;
