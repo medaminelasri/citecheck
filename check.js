@@ -1,5 +1,4 @@
 import { chromium } from "playwright";
-import fs from "fs/promises";
 
 const URL = "https://www.cite-internationale-toulouse.fr/12849-demande-de-logement.htm";
 const FULL_MESSAGE = "La résidence est actuellement complète pour les longs séjours.";
@@ -12,24 +11,27 @@ const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID;
 if (!CHECKIN_DATE || !CHECKOUT_DATE) {
   throw new Error("Missing CHECKIN_DATE or CHECKOUT_DATE");
 }
+
 if (!TELEGRAM_BOT_TOKEN || !TELEGRAM_CHAT_ID) {
   throw new Error("Missing TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID");
 }
 
-async function sendTelegram(text) {
-  const res = await fetch(`https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`, {
+async function sendTelegram(message) {
+  const response = await fetch(`https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`, {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers: {
+      "Content-Type": "application/json"
+    },
     body: JSON.stringify({
       chat_id: TELEGRAM_CHAT_ID,
-      text,
+      text: message,
       disable_web_page_preview: true
     })
   });
 
-  if (!res.ok) {
-    const body = await res.text();
-    throw new Error(`Telegram error: ${res.status} ${body}`);
+  if (!response.ok) {
+    const body = await response.text();
+    throw new Error(`Telegram error: ${response.status} ${body}`);
   }
 }
 
@@ -42,43 +44,64 @@ async function fillDateField(page, labelText, value) {
 
   for (const locator of locators) {
     try {
-      if (await locator.count()) {
+      const count = await locator.count();
+      if (count > 0) {
         const input = locator.first();
         await input.click({ force: true });
         await input.fill("");
-        await input.type(value, { delay: 50 });
+        await input.type(value, { delay: 40 });
         return;
       }
-    } catch {}
+    } catch {
+      // try next locator
+    }
   }
 
   throw new Error(`Could not find field for: ${labelText}`);
 }
 
 async function clickSuivant(page) {
-  const locators = [
+  const buttonLocators = [
     page.getByRole("button", { name: /suivant/i }),
     page.locator(`xpath=//button[contains(normalize-space(.), "Suivant")]`),
     page.locator(`xpath=//input[@type="submit" and contains(@value, "Suivant")]`),
     page.locator("text=Suivant")
   ];
 
-  for (const locator of locators) {
+  for (const locator of buttonLocators) {
     try {
-      if (await locator.count()) {
+      const count = await locator.count();
+      if (count > 0) {
         await locator.first().click({ force: true });
         return;
       }
-    } catch {}
+    } catch {
+      // try next locator
+    }
   }
 
-  throw new Error('Could not find "Suivant" button');
+  throw new Error('Could not find the "Suivant" button');
 }
 
-async function runCheck() {
-  const browser = await chromium.launch({
-    headless: true
-  });
+function normalizeText(text) {
+  return text.replace(/\s+/g, " ").trim();
+}
+
+function pageLooksAvailable(bodyText) {
+  const requiredMarkers = [
+    "Réserver",
+    "Nom *",
+    "Prénom *",
+    "Date de naissance *",
+    "Email *",
+    "ENVOYER MA DEMANDE"
+  ];
+
+  return requiredMarkers.every(marker => bodyText.includes(marker));
+}
+
+async function checkOnce() {
+  const browser = await chromium.launch({ headless: true });
 
   const context = await browser.newContext({
     viewport: { width: 1366, height: 900 },
@@ -92,7 +115,11 @@ async function runCheck() {
   page.setDefaultTimeout(30000);
 
   try {
-    await page.goto(URL, { waitUntil: "domcontentloaded", timeout: 60000 });
+    await page.goto(URL, {
+      waitUntil: "domcontentloaded",
+      timeout: 60000
+    });
+
     await page.waitForTimeout(1500);
 
     await fillDateField(page, "Date de début du séjour", CHECKIN_DATE);
@@ -102,23 +129,23 @@ async function runCheck() {
     await clickSuivant(page);
 
     await page.waitForLoadState("networkidle", { timeout: 60000 }).catch(() => {});
-    await page.waitForTimeout(2500);
+    await page.waitForTimeout(3000);
 
-    const bodyText = await page.locator("body").innerText();
-    const normalized = bodyText.replace(/\s+/g, " ").trim();
-    const hasFullMessage = normalized.includes(FULL_MESSAGE);
+    const currentUrl = page.url();
+    const bodyTextRaw = await page.locator("body").innerText();
+    const bodyText = normalizeText(bodyTextRaw);
+
+    const hasFullMessage = bodyText.includes(FULL_MESSAGE);
+    const hasReservationForm = pageLooksAvailable(bodyText);
+    const hasDateOk = currentUrl.includes("date_ok=1");
 
     return {
-      changed: !hasFullMessage,
-      preview: normalized.slice(0, 1500)
+      currentUrl,
+      hasFullMessage,
+      hasReservationForm,
+      hasDateOk,
+      preview: bodyText.slice(0, 1500)
     };
-  } catch (err) {
-    try {
-      await page.screenshot({ path: "debug.png", fullPage: true });
-      const html = await page.content();
-      await fs.writeFile("debug.html", html, "utf8");
-    } catch {}
-    throw err;
   } finally {
     await context.close();
     await browser.close();
@@ -130,34 +157,47 @@ async function main() {
 
   for (let attempt = 1; attempt <= 3; attempt++) {
     try {
-      const result = await runCheck();
+      const result = await checkOnce();
 
-      if (result.changed) {
-        await sendTelegram(
-          `ALERT ✅ Result changed\n\n` +
-          `The usual message was NOT found:\n` +
-          `"${FULL_MESSAGE}"\n\n` +
-          `Dates: ${CHECKIN_DATE} -> ${CHECKOUT_DATE}\n` +
-          `Page: ${URL}\n\n` +
-          `Preview:\n${result.preview}`
-        );
-        console.log("Alert sent.");
-      } else {
-        console.log("No alert: usual full message still present.");
+      if (result.hasFullMessage) {
+        console.log("No alert: unavailable message still present.");
+        return;
       }
 
+      if (result.hasReservationForm && result.hasDateOk) {
+        await sendTelegram(
+          `ALERT ✅ Reservation form detected\n\n` +
+          `The page looks AVAILABLE for these dates:\n` +
+          `${CHECKIN_DATE} -> ${CHECKOUT_DATE}\n\n` +
+          `URL:\n${result.currentUrl}\n\n` +
+          `Detected markers:\n` +
+          `- Réserver\n` +
+          `- Nom *\n` +
+          `- Prénom *\n` +
+          `- Date de naissance *\n` +
+          `- Email *\n` +
+          `- ENVOYER MA DEMANDE`
+        );
+
+        console.log("Alert sent: reservation form detected.");
+        return;
+      }
+
+      console.log("No alert: page changed, but real reservation form was not detected.");
+      console.log(result.preview);
       return;
-    } catch (err) {
-      lastError = err;
-      console.error(`Attempt ${attempt} failed:`, err.message);
+    } catch (error) {
+      lastError = error;
+      console.error(`Attempt ${attempt} failed:`, error.message);
+
       if (attempt < 3) {
-        await new Promise((r) => setTimeout(r, 5000));
+        await new Promise(resolve => setTimeout(resolve, 5000));
       }
     }
   }
 
   await sendTelegram(
-    `WARNING ⚠️ Housing bot failed after 3 attempts.\n\n` +
+    `WARNING ⚠️ Cite Internationale bot failed after 3 attempts.\n\n` +
     `Dates: ${CHECKIN_DATE} -> ${CHECKOUT_DATE}\n` +
     `Error: ${lastError?.message || "Unknown error"}`
   );
