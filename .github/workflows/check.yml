@@ -5,6 +5,9 @@ on:
     - cron: "17 */2 * * *"
   workflow_dispatch:
 
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
 concurrency:
   group: toulouse-housing-check
   cancel-in-progress: true
@@ -15,12 +18,12 @@ jobs:
 
     steps:
       - name: Checkout repo
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Setup Node
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v5
         with:
-          node-version: "20"
+          node-version: "24"
 
       - name: Install dependencies
         run: npm install
@@ -34,4 +37,5 @@ jobs:
           CHECKOUT_DATE: ${{ vars.CHECKOUT_DATE }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          FORCE_TEST_ALERT: ${{ vars.FORCE_TEST_ALERT }}
         run: node check.js
