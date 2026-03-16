@@ -2,7 +2,7 @@ name: Check Toulouse Housing
 
 on:
   schedule:
-    - cron: "*/5 * * * *"
+    - cron: "*/7 * * * *"
   workflow_dispatch:
 
 env:
