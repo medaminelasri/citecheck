@@ -1,7 +1,10 @@
 import { chromium } from "playwright";
+import fs from "fs";
 
 const URL = "https://www.cite-internationale-toulouse.fr/12849-demande-de-logement.htm";
 const FULL_MESSAGE = "La résidence est actuellement complète pour les longs séjours.";
+const STATE_FILE = "state.json";
+const DAY_MS = 24 * 60 * 60 * 1000;
 
 const CHECKIN_DATE = process.env.CHECKIN_DATE;
 const CHECKOUT_DATE = process.env.CHECKOUT_DATE;
@@ -37,6 +40,22 @@ async function sendTelegram(message) {
 
 function normalizeText(text) {
   return text.replace(/\s+/g, " ").trim();
+}
+
+function readState() {
+  try {
+    return JSON.parse(fs.readFileSync(STATE_FILE, "utf8"));
+  } catch {
+    return {
+      lastStatus: "unknown",
+      lastAvailabilityAt: null,
+      lastNoAvailabilityReportAt: null
+    };
+  }
+}
+
+function writeState(state) {
+  fs.writeFileSync(STATE_FILE, JSON.stringify(state, null, 2));
 }
 
 async function fillDateField(page, labelText, value) {
@@ -88,38 +107,19 @@ async function detectResult(page) {
 
   const hasFullMessage = bodyText.includes(FULL_MESSAGE);
   const hasDateOk = currentUrl.includes("date_ok=1");
-
-  const textMarkers = {
-    typeLogement: bodyText.includes("Type de logement"),
-    nom: bodyText.includes("Nom"),
-    prenom: bodyText.includes("Prénom"),
-    email: bodyText.includes("Email")
-  };
-
-  const inputCount = await page.locator("input").count().catch(() => 0);
+  const hasTypeLogement = bodyText.includes("Type de logement");
   const selectCount = await page.locator("select").count().catch(() => 0);
-  const submitButtonCount = await page.locator('button, input[type="submit"]').count().catch(() => 0);
 
-  const looksLikeAvailableForm =
-    hasDateOk &&
-    !hasFullMessage &&
-    textMarkers.typeLogement &&
-    textMarkers.nom &&
-    textMarkers.prenom &&
-    textMarkers.email &&
-    inputCount >= 8 &&
-    selectCount >= 1 &&
-    submitButtonCount >= 1;
+  const isAvailable = hasDateOk && hasTypeLogement && selectCount >= 1;
+  const isUnavailable = hasFullMessage;
 
   return {
     currentUrl,
-    hasFullMessage,
+    isAvailable,
+    isUnavailable,
     hasDateOk,
-    textMarkers,
-    inputCount,
-    selectCount,
-    submitButtonCount,
-    looksLikeAvailableForm
+    hasTypeLogement,
+    selectCount
   };
 }
 
@@ -130,7 +130,7 @@ async function waitForStableResult(page) {
   while (Date.now() - start < timeoutMs) {
     const result = await detectResult(page);
 
-    if (result.hasFullMessage || result.looksLikeAvailableForm) {
+    if (result.isAvailable || result.isUnavailable) {
       return result;
     }
 
@@ -179,6 +179,8 @@ async function checkOnce() {
 }
 
 async function main() {
+  const state = readState();
+  const now = Date.now();
   let lastError;
 
   for (let attempt = 1; attempt <= 3; attempt++) {
@@ -186,31 +188,60 @@ async function main() {
       const result = await checkOnce();
 
       console.log("Final URL:", result.currentUrl);
-      console.log("hasFullMessage:", result.hasFullMessage);
+      console.log("isAvailable:", result.isAvailable);
+      console.log("isUnavailable:", result.isUnavailable);
       console.log("hasDateOk:", result.hasDateOk);
-      console.log("looksLikeAvailableForm:", result.looksLikeAvailableForm);
-      console.log("textMarkers:", result.textMarkers);
-      console.log("inputCount:", result.inputCount);
+      console.log("hasTypeLogement:", result.hasTypeLogement);
       console.log("selectCount:", result.selectCount);
-      console.log("submitButtonCount:", result.submitButtonCount);
 
-      if (result.hasFullMessage) {
-        console.log("No alert: unavailable message detected.");
+      if (result.isAvailable) {
+        if (state.lastStatus !== "available") {
+          await sendTelegram(
+            `ALERT ✅ Housing available\n\n` +
+            `Dates: ${CHECKIN_DATE} -> ${CHECKOUT_DATE}\n` +
+            `URL: ${result.currentUrl}`
+          );
+          console.log("Availability alert sent.");
+        } else {
+          console.log("Availability still present, no duplicate alert.");
+        }
+
+        state.lastStatus = "available";
+        state.lastAvailabilityAt = new Date(now).toISOString();
+        writeState(state);
         return;
       }
 
-      if (result.looksLikeAvailableForm) {
-        await sendTelegram(
-          `ALERT ✅ Housing form detected\n\n` +
-          `Dates: ${CHECKIN_DATE} -> ${CHECKOUT_DATE}\n` +
-          `URL: ${result.currentUrl}\n\n` +
-          `The reservation form appears to be available.`
-        );
-        console.log("Alert sent.");
+      if (result.isUnavailable) {
+        state.lastStatus = "unavailable";
+
+        const hadAvailabilityInLast24h =
+          state.lastAvailabilityAt &&
+          now - new Date(state.lastAvailabilityAt).getTime() < DAY_MS;
+
+        const shouldSendDailyNoAvailability =
+          !hadAvailabilityInLast24h &&
+          (
+            !state.lastNoAvailabilityReportAt ||
+            now - new Date(state.lastNoAvailabilityReportAt).getTime() >= DAY_MS
+          );
+
+        if (shouldSendDailyNoAvailability) {
+          await sendTelegram(
+            `INFO ℹ️ No availability in the last 24 hours\n\n` +
+            `Dates: ${CHECKIN_DATE} -> ${CHECKOUT_DATE}`
+          );
+          state.lastNoAvailabilityReportAt = new Date(now).toISOString();
+          console.log("24h no-availability message sent.");
+        } else {
+          console.log("No daily no-availability message needed.");
+        }
+
+        writeState(state);
         return;
       }
 
-      console.log("No alert: page did not match unavailable page or available form strongly enough.");
+      console.log("No alert: page was neither clearly available nor clearly unavailable.");
       return;
     } catch (error) {
       lastError = error;
