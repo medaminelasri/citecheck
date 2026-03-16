@@ -179,6 +179,7 @@ async function checkOnce() {
 }
 
 async function main() {
+  console.log("GitHub event:", process.env.GITHUB_EVENT_NAME);
   const state = readState();
   const now = Date.now();
   let lastError;
