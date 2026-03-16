@@ -7,6 +7,7 @@ const CHECKIN_DATE = process.env.CHECKIN_DATE;
 const CHECKOUT_DATE = process.env.CHECKOUT_DATE;
 const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID;
+const FORCE_TEST_ALERT = String(process.env.FORCE_TEST_ALERT || "").toLowerCase() === "true";
 
 if (!CHECKIN_DATE || !CHECKOUT_DATE) {
   throw new Error("Missing CHECKIN_DATE or CHECKOUT_DATE");
@@ -42,8 +43,7 @@ async function fillDateByLabel(page, labelText, value) {
 
   for (const locator of strategies) {
     try {
-      const count = await locator.count();
-      if (count > 0) {
+      if (await locator.count()) {
         const input = locator.first();
         await input.click({ force: true });
         await input.fill(value);
@@ -78,13 +78,29 @@ async function main() {
 
     const bodyText = await page.locator("body").innerText();
 
-    if (!bodyText.includes(UNAVAILABLE_TEXT)) {
-      const message =
-        `ALERT: housing result changed.\n\n` +
+    const isUnavailable = bodyText.includes(UNAVAILABLE_TEXT);
+
+    if (FORCE_TEST_ALERT) {
+      await sendTelegram(
+        `TEST ALERT ✅\n\n` +
+        `The script ran correctly.\n` +
         `Dates: ${CHECKIN_DATE} -> ${CHECKOUT_DATE}\n` +
-        `Page: ${URL}`;
-      await sendTelegram(message);
-      console.log("Alert sent.");
+        `Current result: ${isUnavailable ? "still unavailable" : "availability may have changed"}\n` +
+        `Page: ${URL}`
+      );
+      console.log("Test alert sent.");
+      return;
+    }
+
+    if (!isUnavailable) {
+      const shortText = bodyText.slice(0, 1200);
+      await sendTelegram(
+        `ALERT ✅ Housing result changed\n\n` +
+        `Dates: ${CHECKIN_DATE} -> ${CHECKOUT_DATE}\n` +
+        `Page: ${URL}\n\n` +
+        `Preview:\n${shortText}`
+      );
+      console.log("Availability alert sent.");
     } else {
       console.log("Still unavailable.");
     }
