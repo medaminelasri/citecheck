@@ -81,58 +81,7 @@ async function clickSuivant(page) {
   throw new Error('Could not find the "Suivant" button');
 }
 
-async function waitForResult(page) {
-  const start = Date.now();
-  const timeoutMs = 45000;
-
-  while (Date.now() - start < timeoutMs) {
-    const currentUrl = page.url();
-    const bodyText = normalizeText(await page.locator("body").innerText().catch(() => ""));
-
-    const hasFullMessage = bodyText.includes(FULL_MESSAGE);
-
-    const hasReservationForm =
-      bodyText.includes("Réserver") &&
-      bodyText.includes("Nom *") &&
-      bodyText.includes("Prénom *") &&
-      bodyText.includes("Date de naissance *") &&
-      bodyText.includes("Email *") &&
-      bodyText.includes("ENVOYER MA DEMANDE");
-
-    const hasDateOk = currentUrl.includes("date_ok=1");
-
-    if (hasFullMessage || hasReservationForm || hasDateOk) {
-      return {
-        currentUrl,
-        bodyText,
-        hasFullMessage,
-        hasReservationForm,
-        hasDateOk
-      };
-    }
-
-    await page.waitForTimeout(1500);
-  }
-
-  const currentUrl = page.url();
-  const bodyText = normalizeText(await page.locator("body").innerText().catch(() => ""));
-
-  return {
-    currentUrl,
-    bodyText,
-    hasFullMessage: bodyText.includes(FULL_MESSAGE),
-    hasReservationForm:
-      bodyText.includes("Réserver") &&
-      bodyText.includes("Nom *") &&
-      bodyText.includes("Prénom *") &&
-      bodyText.includes("Date de naissance *") &&
-      bodyText.includes("Email *") &&
-      bodyText.includes("ENVOYER MA DEMANDE"),
-    hasDateOk: currentUrl.includes("date_ok=1")
-  };
-}
-
-async function checkOnce() {
+async function main() {
   const browser = await chromium.launch({ headless: true });
 
   const context = await browser.newContext({
@@ -144,7 +93,6 @@ async function checkOnce() {
   });
 
   const page = await context.newPage();
-  page.setDefaultTimeout(30000);
 
   try {
     await page.goto(URL, {
@@ -160,72 +108,80 @@ async function checkOnce() {
     await page.waitForTimeout(1000);
     await clickSuivant(page);
 
-    await page.waitForLoadState("domcontentloaded", { timeout: 30000 }).catch(() => {});
-    await page.waitForTimeout(2000);
+    await page.waitForTimeout(8000);
 
-    const result = await waitForResult(page);
+    const finalUrl = page.url();
+    const bodyText = normalizeText(await page.locator("body").innerText().catch(() => ""));
 
-    return {
-      currentUrl: result.currentUrl,
-      hasFullMessage: result.hasFullMessage,
-      hasReservationForm: result.hasReservationForm,
-      hasDateOk: result.hasDateOk,
-      preview: result.bodyText.slice(0, 1500)
+    const hasFullMessage = bodyText.includes(FULL_MESSAGE);
+    const hasDateOk = finalUrl.includes("date_ok=1");
+
+    const markers = {
+      reserver: bodyText.includes("Réserver"),
+      nom: bodyText.includes("Nom *"),
+      prenom: bodyText.includes("Prénom *"),
+      naissance: bodyText.includes("Date de naissance *"),
+      email: bodyText.includes("Email *"),
+      envoyer: bodyText.includes("ENVOYER MA DEMANDE")
     };
+
+    const confirmedAvailable =
+      hasDateOk &&
+      markers.reserver &&
+      markers.nom &&
+      markers.prenom &&
+      markers.naissance &&
+      markers.email &&
+      markers.envoyer;
+
+    console.log("Final URL:", finalUrl);
+    console.log("hasFullMessage:", hasFullMessage);
+    console.log("hasDateOk:", hasDateOk);
+    console.log("markers:", markers);
+    console.log("Preview:", bodyText.slice(0, 1200));
+
+    if (hasFullMessage) {
+      console.log("No alert: unavailable message detected.");
+      return;
+    }
+
+    if (confirmedAvailable) {
+      await sendTelegram(
+        `ALERT ✅ Reservation form detected\n\n` +
+        `Dates: ${CHECKIN_DATE} -> ${CHECKOUT_DATE}\n` +
+        `URL: ${finalUrl}`
+      );
+      console.log("Availability alert sent.");
+      return;
+    }
+
+    await sendTelegram(
+      `DEBUG ⚠️ Page changed but not confirmed\n\n` +
+      `Dates: ${CHECKIN_DATE} -> ${CHECKOUT_DATE}\n` +
+      `URL: ${finalUrl}\n` +
+      `date_ok=1: ${hasDateOk}\n` +
+      `Réserver: ${markers.reserver}\n` +
+      `Nom *: ${markers.nom}\n` +
+      `Prénom *: ${markers.prenom}\n` +
+      `Date de naissance *: ${markers.naissance}\n` +
+      `Email *: ${markers.email}\n` +
+      `ENVOYER MA DEMANDE: ${markers.envoyer}\n\n` +
+      `Preview:\n${bodyText.slice(0, 1000)}`
+    );
+
+    console.log("Debug message sent.");
+  } catch (error) {
+    console.error("Check failed:", error);
+    await sendTelegram(
+      `WARNING ⚠️ Bot error\n\n` +
+      `Dates: ${CHECKIN_DATE} -> ${CHECKOUT_DATE}\n` +
+      `Error: ${error.message}`
+    );
+    throw error;
   } finally {
     await context.close();
     await browser.close();
   }
-}
-
-async function main() {
-  let lastError;
-
-  for (let attempt = 1; attempt <= 3; attempt++) {
-    try {
-      const result = await checkOnce();
-
-      console.log("Final URL:", result.currentUrl);
-      console.log("hasFullMessage:", result.hasFullMessage);
-      console.log("hasReservationForm:", result.hasReservationForm);
-      console.log("hasDateOk:", result.hasDateOk);
-      console.log("Preview:", result.preview);
-
-      if (result.hasFullMessage) {
-        console.log("No alert: unavailable message detected.");
-        return;
-      }
-
-      if (result.hasDateOk && result.hasReservationForm) {
-        await sendTelegram(
-          `ALERT ✅ Reservation form detected\n\n` +
-          `Dates: ${CHECKIN_DATE} -> ${CHECKOUT_DATE}\n\n` +
-          `URL:\n${result.currentUrl}\n\n` +
-          `The page appears to be available and shows the reservation form.`
-        );
-        console.log("Alert sent.");
-        return;
-      }
-
-      console.log("No alert: neither unavailable page nor confirmed reservation form.");
-      return;
-    } catch (error) {
-      lastError = error;
-      console.error(`Attempt ${attempt} failed:`, error.message);
-
-      if (attempt < 3) {
-        await new Promise(resolve => setTimeout(resolve, 5000));
-      }
-    }
-  }
-
-  await sendTelegram(
-    `WARNING ⚠️ Cite Internationale bot failed after 3 attempts.\n\n` +
-    `Dates: ${CHECKIN_DATE} -> ${CHECKOUT_DATE}\n` +
-    `Error: ${lastError?.message || "Unknown error"}`
-  );
-
-  throw lastError;
 }
 
 main();
