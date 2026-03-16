@@ -53,6 +53,7 @@ async function fillDateField(page, labelText, value) {
         await input.click({ force: true });
         await input.fill("");
         await input.type(value, { delay: 40 });
+        await input.press("Tab").catch(() => {});
         return;
       }
     } catch {}
@@ -81,7 +82,69 @@ async function clickSuivant(page) {
   throw new Error('Could not find the "Suivant" button');
 }
 
-async function main() {
+async function detectFormPage(page) {
+  const bodyText = normalizeText(await page.locator("body").innerText().catch(() => ""));
+  const hasFullMessage = bodyText.includes(FULL_MESSAGE);
+
+  const textMarkers = {
+    typeLogement: bodyText.includes("Type de logement"),
+    envoyer: bodyText.includes("ENVOYER MA DEMANDE"),
+    nom: bodyText.includes("Nom"),
+    prenom: bodyText.includes("Prénom"),
+    email: bodyText.includes("Email")
+  };
+
+  const inputCount = await page.locator("input").count().catch(() => 0);
+  const selectCount = await page.locator("select").count().catch(() => 0);
+  const submitButtonCount = await page
+    .locator('button:has-text("ENVOYER MA DEMANDE"), input[type="submit"]')
+    .count()
+    .catch(() => 0);
+
+  const looksLikeRealForm =
+    !hasFullMessage &&
+    textMarkers.typeLogement &&
+    textMarkers.envoyer &&
+    textMarkers.nom &&
+    textMarkers.prenom &&
+    textMarkers.email &&
+    inputCount >= 4 &&
+    selectCount >= 1 &&
+    submitButtonCount >= 1;
+
+  return {
+    hasFullMessage,
+    looksLikeRealForm,
+    textMarkers,
+    inputCount,
+    selectCount,
+    submitButtonCount,
+    currentUrl: page.url()
+  };
+}
+
+async function waitForStableResult(page) {
+  const timeoutMs = 45000;
+  const start = Date.now();
+
+  while (Date.now() - start < timeoutMs) {
+    const result = await detectFormPage(page);
+
+    if (result.hasFullMessage) {
+      return result;
+    }
+
+    if (result.looksLikeRealForm) {
+      return result;
+    }
+
+    await page.waitForTimeout(1500);
+  }
+
+  return await detectFormPage(page);
+}
+
+async function checkOnce() {
   const browser = await chromium.launch({ headless: true });
 
   const context = await browser.newContext({
@@ -93,6 +156,7 @@ async function main() {
   });
 
   const page = await context.newPage();
+  page.setDefaultTimeout(30000);
 
   try {
     await page.goto(URL, {
@@ -105,83 +169,69 @@ async function main() {
     await fillDateField(page, "Date de début du séjour", CHECKIN_DATE);
     await fillDateField(page, "Date de fin du séjour", CHECKOUT_DATE);
 
-    await page.waitForTimeout(1000);
+    await page.waitForTimeout(1200);
     await clickSuivant(page);
 
-    await page.waitForTimeout(8000);
+    await page.waitForLoadState("domcontentloaded", { timeout: 30000 }).catch(() => {});
+    await page.waitForTimeout(2500);
 
-    const finalUrl = page.url();
-    const bodyText = normalizeText(await page.locator("body").innerText().catch(() => ""));
-
-    const hasFullMessage = bodyText.includes(FULL_MESSAGE);
-    const hasDateOk = finalUrl.includes("date_ok=1");
-
-    const markers = {
-      reserver: bodyText.includes("Réserver"),
-      nom: bodyText.includes("Nom *"),
-      prenom: bodyText.includes("Prénom *"),
-      naissance: bodyText.includes("Date de naissance *"),
-      email: bodyText.includes("Email *"),
-      envoyer: bodyText.includes("ENVOYER MA DEMANDE")
-    };
-
-    const confirmedAvailable =
-      hasDateOk &&
-      markers.reserver &&
-      markers.nom &&
-      markers.prenom &&
-      markers.naissance &&
-      markers.email &&
-      markers.envoyer;
-
-    console.log("Final URL:", finalUrl);
-    console.log("hasFullMessage:", hasFullMessage);
-    console.log("hasDateOk:", hasDateOk);
-    console.log("markers:", markers);
-    console.log("Preview:", bodyText.slice(0, 1200));
-
-    if (hasFullMessage) {
-      console.log("No alert: unavailable message detected.");
-      return;
-    }
-
-    if (confirmedAvailable) {
-      await sendTelegram(
-        `ALERT ✅ Reservation form detected\n\n` +
-        `Dates: ${CHECKIN_DATE} -> ${CHECKOUT_DATE}\n` +
-        `URL: ${finalUrl}`
-      );
-      console.log("Availability alert sent.");
-      return;
-    }
-
-    await sendTelegram(
-      `DEBUG ⚠️ Page changed but not confirmed\n\n` +
-      `Dates: ${CHECKIN_DATE} -> ${CHECKOUT_DATE}\n` +
-      `URL: ${finalUrl}\n` +
-      `date_ok=1: ${hasDateOk}\n` +
-      `Réserver: ${markers.reserver}\n` +
-      `Nom *: ${markers.nom}\n` +
-      `Prénom *: ${markers.prenom}\n` +
-      `Date de naissance *: ${markers.naissance}\n` +
-      `Email *: ${markers.email}\n` +
-      `ENVOYER MA DEMANDE: ${markers.envoyer}\n\n` +
-      `Preview:\n${bodyText.slice(0, 1000)}`
-    );
-
-    console.log("Debug message sent.");
-  } catch (error) {
-    console.error("Check failed:", error);
-    await sendTelegram(
-      `WARNING ⚠️ Bot error\n\n` +
-      `Dates: ${CHECKIN_DATE} -> ${CHECKOUT_DATE}\n` +
-      `Error: ${error.message}`
-    );
-    throw error;
+    return await waitForStableResult(page);
   } finally {
     await context.close();
     await browser.close();
   }
+}
+
+async function main() {
+  let lastError;
+
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    try {
+      const result = await checkOnce();
+
+      console.log("Final URL:", result.currentUrl);
+      console.log("hasFullMessage:", result.hasFullMessage);
+      console.log("looksLikeRealForm:", result.looksLikeRealForm);
+      console.log("textMarkers:", result.textMarkers);
+      console.log("inputCount:", result.inputCount);
+      console.log("selectCount:", result.selectCount);
+      console.log("submitButtonCount:", result.submitButtonCount);
+
+      if (result.hasFullMessage) {
+        console.log("No alert: unavailable message detected.");
+        return;
+      }
+
+      if (result.looksLikeRealForm) {
+        await sendTelegram(
+          `ALERT ✅ Housing form detected\n\n` +
+          `Dates: ${CHECKIN_DATE} -> ${CHECKOUT_DATE}\n` +
+          `URL: ${result.currentUrl}\n\n` +
+          `The reservation form appears to be available.`
+        );
+        console.log("Alert sent.");
+        return;
+      }
+
+      console.log("No alert: page did not match unavailable page or real form page.");
+      return;
+    } catch (error) {
+      lastError = error;
+      console.error(`Attempt ${attempt} failed:`, error.message);
+
+      if (attempt < 3) {
+        await new Promise(resolve => setTimeout(resolve, 5000));
+      }
+    }
+  }
+
+  await sendTelegram(
+    `WARNING ⚠️ Cite Internationale bot failed after 3 attempts.\n\n` +
+    `Dates: ${CHECKIN_DATE} -> ${CHECKOUT_DATE}\n` +
+    `Error: ${lastError?.message || "Unknown error"}`
+  );
+
+  throw lastError;
 }
 
 main();
